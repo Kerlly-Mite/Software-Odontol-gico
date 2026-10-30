@@ -25,10 +25,14 @@ Estado de esta revisión: **en curso; no autorizado para producción**.
 7. Reinicia la API conservando `MFA_ENCRYPTION_KEY` y confirma que la cuenta siga autenticándose; luego comprueba que cambiar esa clave invalida el descifrado como se espera.
 8. En la pantalla clínica, confirma el cierre tras 15 minutos sin actividad.
 9. Verifica en PostgreSQL que el `audit_log` registra consultas y cambios autorizados, y que no permite `UPDATE` ni `DELETE`.
+10. Crea una nota SOAP nueva y confirma que la API la muestra con firma HMAC verificada y `lockedAt` según `CLINICAL_NOTE_LOCK_HOURS` (24 por defecto); confirma que cualquier edición o borrado directo se rechaza y que la corrección se registra como adenda.
+11. Crea un consentimiento de un paciente adulto, captura la firma en pantalla y confirma que la lista indica `Firmado` y `signatureVerified: true`; repite con un menor y confirma que solo acepte el tutor legal registrado.
+12. Confirma que un consentimiento firmado rechaza cambios y borrado en PostgreSQL. La captura es una firma electrónica de demostración y no sustituye certificado legal ni OTP.
 
 ## Revisión de seguridad y bloqueos de producción
 
 - MFA TOTP: implementada para todas las rutas protegidas; **validación runtime, limitación de intentos, recuperación de cuenta y gestión de clave productiva pendientes**.
+- Firma HMAC de notas/adendas y captura manuscrita HMAC de consentimientos: implementadas en código; **casos UAT 10–12 pendientes**. No equivalen a firma digital legal certificada.
 - TLS 1.3: **pendiente**. Compose es solo para desarrollo local y no configura TLS.
 - Audit log: el middleware registra solicitudes autorizadas a endpoints protegidos y la base impide modificar o borrar eventos. El registro de denegaciones y exportaciones requiere completar cobertura y validación en PostgreSQL.
 - Cierre por inactividad: el frontend cierra la sesión tras 15 minutos; la expiración y revocación del token en servidor requieren completar validación.

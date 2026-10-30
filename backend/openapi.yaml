@@ -95,6 +95,99 @@ paths:
       responses:
         '201': { description: Paciente creado }
         '400': { $ref: '#/components/responses/Error' }
+  /api/patients/{patientID}:
+    put:
+      tags: [Pacientes]
+      security: [{ bearerAuth: [] }]
+      summary: Actualizar ficha, alertas médicas, tutor y seguro del paciente
+      parameters:
+        - { $ref: '#/components/parameters/PatientID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatientInput' }
+      responses:
+        '200': { description: Ficha actualizada }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/treatment-plans:
+    get:
+      tags: [Pacientes]
+      security: [{ bearerAuth: [] }]
+      summary: Listar presupuestos y planes por paciente
+      parameters:
+        - { in: query, name: patientId, schema: { type: integer } }
+      responses:
+        '200': { description: Planes, partidas, costos, aprobaciones y citas asociadas }
+    post:
+      tags: [Pacientes]
+      security: [{ bearerAuth: [] }]
+      summary: Crear presupuesto por fases y sesiones
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patientId, title, items]
+              properties:
+                patientId: { type: integer }
+                title: { type: string }
+                discount: { type: number, minimum: 0 }
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 30
+                  items:
+                    type: object
+                    required: [procedure, phase, sessions, fee]
+                    properties:
+                      procedure: { type: string }
+                      phase: { type: integer, minimum: 1 }
+                      sessions: { type: integer, minimum: 1, maximum: 100 }
+                      fee: { type: number, minimum: 0 }
+                      labCost: { type: number, minimum: 0 }
+                      materialsCost: { type: number, minimum: 0 }
+      responses:
+        '201': { description: Presupuesto guardado }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/treatment-plans/{id}/approval:
+    post:
+      tags: [Pacientes]
+      security: [{ bearerAuth: [] }]
+      summary: Registrar aprobación total o parcial del paciente
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [itemIds]
+              properties:
+                itemIds: { type: array, minItems: 1, items: { type: integer } }
+      responses:
+        '200': { description: Partidas aprobadas y disponibles para agendar }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/cash/close:
+    post:
+      tags: [Caja]
+      security: [{ bearerAuth: [] }]
+      summary: Cerrar caja a ciegas
+      description: Recibe primero el efectivo declarado; la respuesta revela el esperado y la diferencia únicamente tras el registro.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [declaredCash]
+              properties:
+                declaredCash: { type: number, minimum: 0 }
+      responses:
+        '201': { description: Cierre registrado con efectivo esperado y diferencia }
+        '400': { $ref: '#/components/responses/Error' }
   /api/appointments:
     get:
       tags: [Agenda]
@@ -173,7 +266,7 @@ paths:
       security: [{ bearerAuth: [] }]
       summary: Listar notas clínicas SOAP
       responses:
-        '200': { description: Notas inmutables del paciente }
+        '200': { description: Notas SOAP inmutables, con HMAC y plazo de política de bloqueo }
     post:
       tags: [Expediente]
       security: [{ bearerAuth: [] }]
@@ -190,7 +283,29 @@ paths:
                 assessment: { type: string }
                 plan: { type: string }
       responses:
-        '201': { description: Nota agregada al expediente }
+        '201': { description: Nota agregada y firmada con HMAC-SHA256 del servidor }
+  /api/patients/{patientID}/clinical-notes/{noteID}/amendments:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+      - { in: path, name: noteID, required: true, schema: { type: integer } }
+    post:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Crear una adenda SOAP firmada y vinculada a una nota inmutable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subjective: { type: string }
+                objective: { type: string }
+                assessment: { type: string }
+                plan: { type: string }
+      responses:
+        '201': { description: Adenda creada }
+        '404': { $ref: '#/components/responses/Error' }
   /api/patients/{patientID}/odontograms:
     parameters:
       - { $ref: '#/components/parameters/PatientID' }
@@ -288,6 +403,30 @@ paths:
               properties: { procedure: { type: string } }
       responses:
         '201': { description: Consentimiento pendiente de firma }
+  /api/patients/{patientID}/consents/{consentID}/signature:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+      - { in: path, name: consentID, required: true, schema: { type: integer } }
+    post:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Capturar firma manuscrita electrónica del paciente o tutor legal
+      description: Almacena un PNG firmado mediante HMAC-SHA256 del servidor. No reemplaza un certificado de firma digital legal ni un OTP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signerName, signerRole, signature]
+              properties:
+                signerName: { type: string }
+                signerRole: { type: string, enum: [patient, guardian] }
+                signature: { type: string, description: Data URL PNG de la firma dibujada }
+      responses:
+        '200': { description: Consentimiento firmado; la respuesta confirma verificación de integridad }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
   /api/inventory/products:
     get:
       tags: [Inventario]

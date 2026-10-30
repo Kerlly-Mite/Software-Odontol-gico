@@ -46,6 +46,7 @@ export const api = {
   createPrescription: (patientId, data) => request(`/api/patients/${patientId}/prescriptions`, { method: 'POST', body: JSON.stringify(data) }),
   consents: (patientId) => request(`/api/patients/${patientId}/consents`),
   createConsent: (patientId, data) => request(`/api/patients/${patientId}/consents`, { method: 'POST', body: JSON.stringify(data) }),
+  signConsent: (patientId, consentId, data) => request(`/api/patients/${patientId}/consents/${consentId}/signature`, { method: 'POST', body: JSON.stringify(data) }),
   inventoryProducts: () => request('/api/inventory/products'),
   createInventoryProduct: (data) => request('/api/inventory/products', { method: 'POST', body: JSON.stringify(data) }),
   inventoryMovements: (productId) => request(`/api/inventory/movements${productId ? `?productId=${productId}` : ''}`),

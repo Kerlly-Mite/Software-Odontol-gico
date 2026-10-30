@@ -32,14 +32,14 @@ Las cuentas locales usan `Demo123!`: `admin@sigo.local`, `recepcion@sigo.local`,
 | RF-02 | Alertas de alergias/condiciones destacadas en expediente; validación clínica y reglas configurables aún requieren revisión. |
 | RF-03 | Odontograma permanente/temporal, superficies, FDI/Universal y hallazgos de caries, restauración, endodoncia, implante, prótesis, exodoncia, sellante y ausencia. La persistencia usa el identificador dental canónico FDI. |
 | RF-04 | Sondaje en seis sitios, margen, NIC calculado, sangrado, movilidad y furca. Requiere validación clínica antes de uso asistencial. |
-| RF-05 | Notas SOAP append-only y endpoint/UI para adendas. El bloqueo configurable de 24 horas y una firma digital legal no están implementados; la marca actual identifica la sesión del usuario. |
-| RF-06 | Consentimientos registrables; firma biométrica y OTP real pendientes. |
+| RF-05 | Notas SOAP append-only y adendas. Cada nota nueva recibe HMAC-SHA256 del servidor y expone el vencimiento de la política configurable (`CLINICAL_NOTE_LOCK_HOURS`, 24 por defecto). El esquema bloquea cambios desde la creación, una regla más estricta que 24 horas. El HMAC es una firma técnica de demo, no un certificado de firma digital legal. |
+| RF-06 | Consentimiento con captura manuscrita en mouse/pantalla táctil, control de tutor legal para menores e integridad HMAC. OTP y certificado legal requieren proveedor/certificado externo. |
 | RF-07 / RF-08 | Presupuestos por fases/sesiones, costos, descuentos y aprobación total/parcial; partidas aprobadas se pueden vincular a citas. |
 | RF-09 / RF-10 / RN-03 | Agenda por sillón/profesional, estados de citas y protección contra doble reserva del sillón. |
 | RF-11 | No implementado: WhatsApp/SMS/correo requiere cuentas y proveedores externos. |
 | RF-12 | Registro básico de cobros; facturación electrónica fiscal y pagos reales no implementados. |
 | RF-13 / RF-14 | Reglas de honorarios estimados y descargo de inventario al completar procedimientos. No es liquidación contable/fiscal. |
-| RN-01 | Notas inmutables y creación de adendas vinculadas; firma legal pendiente. |
+| RN-01 | Notas firmadas e inmutables, adendas vinculadas y consentimientos firmados protegidos contra cambios. HMAC técnico; certificado legal pendiente. |
 | RN-02 | Cierre de caja ciego: recepción registra el efectivo contado antes de ver el efectivo esperado y diferencia. |
 | RNF-05 / RNF-06 | Roles, MFA TOTP y auditoría disponibles en el prototipo; faltan revisión de seguridad, recuperación y limitación de intentos. |
 | RNF-07 | Diseño responsive implementado; falta validación formal en la matriz de dispositivos y navegadores solicitada. |
@@ -48,11 +48,13 @@ Las cuentas locales usan `Demo123!`: `admin@sigo.local`, `recepcion@sigo.local`,
 
 - Conseguir VPS/servidor con IP pública, configurar firewall y dominio, HTTPS/TLS 1.3 y certificados. El repositorio incluye `docker-compose.prod.yml` y `.env.prod.example`, pero **no se ha desplegado** porque aún no hay servidor/IP pública.
 - Cifrado de datos en reposo, copias de seguridad cifradas y prueba de restauración.
-- Integraciones reales de mensajería y facturación fiscal, firma digital/OTP y pasarela de pagos.
+- Integraciones reales de mensajería, facturación fiscal, OTP y firma digital legal, y pasarela de pagos.
 - Pruebas de rendimiento/disponibilidad/concurrencia, cobertura unitaria e integración del 80% en endpoints críticos, escaneos SAST/DAST y completar/revisar el contrato OpenAPI.
 - UAT, auditoría de seguridad y validación clínica/legal antes de cualquier uso real.
 
-## Despliegue de producción
+## Preparación de Docker para servidor
+
+No ejecutar este despliegue hasta que el ingeniero lo autorice y se asigne el servidor. La receta queda documentada para esa etapa.
 
 Usa `.env.prod.example` como plantilla para crear `.env.prod` localmente; no compartas ni subas `.env.prod`. Configura secretos nuevos y una contraseña PostgreSQL fuerte. Cuando exista el VPS, abre solo los puertos web necesarios (80/443); la base y API no deben exponerse directamente a Internet. Para iniciar en el servidor, desde la raíz del repositorio:
 
@@ -62,12 +64,10 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 
 Verifica el estado con `docker compose -f docker-compose.prod.yml --env-file .env.prod ps` y los logs con `docker compose -f docker-compose.prod.yml --env-file .env.prod logs api`. No publiques logs o archivos de entorno que incluyan secretos.
 
-## Demo pública en Render
+## Despliegue público
 
-El archivo [`render.yaml`](render.yaml) declara una API Go, la web estática Vite y PostgreSQL administrado. Para una demo académica, los servicios están configurados en el plan Free. Desde Render Dashboard selecciona **New → Blueprint**, conecta este repositorio de GitHub y confirma la creación de los tres recursos. Render genera `JWT_SECRET`, `MFA_ENCRYPTION_KEY` y la contraseña de PostgreSQL; no copies los secretos locales de `.env.prod` a Render. La API inicializa el esquema si la base está vacía.
-
-Cuando los servicios terminen de desplegarse, abre la URL pública del servicio `sigo-dental-web`; la API se comunica con la URL del servicio `sigo-dental-api`. El API tiene health check en `/api/health`. Las bases de datos Free de Render expiran a los 30 días, tienen 1 GB y no incluyen backups; esta configuración sirve para una demostración temporal, no para conservar datos. Usa únicamente datos ficticios y revisa el consumo/límites en el Dashboard.
+El despliegue público está **en espera de nueva orden del ingeniero**. No crees recursos ni elimines bases de datos de Render para esta entrega: el espacio ya tiene una base gratuita activa que pertenece a otro proyecto y Render solo permite una base PostgreSQL Free activa por espacio. El archivo `render.yaml` queda como referencia técnica; la publicación requerirá una base autorizada y una nueva instrucción.
 
 ## Documentación técnica
 
-Existe un borrador OpenAPI 3.0 en `backend/openapi.yaml` y notas UAT/seguridad en [`docs/FASE4-UAT-Y-SEGURIDAD.md`](docs/FASE4-UAT-Y-SEGURIDAD.md). El contrato OpenAPI todavía no cubre todos los endpoints.
+Existe un borrador OpenAPI 3.0 en `backend/openapi.yaml` y notas UAT/seguridad en [`docs/FASE4-UAT-Y-SEGURIDAD.md`](docs/FASE4-UAT-Y-SEGURIDAD.md). El contrato OpenAPI todavía no cubre todos los endpoints. Las claves nuevas son `CLINICAL_SIGNING_KEY` (secreto estable de al menos 32 caracteres) y `CLINICAL_NOTE_LOCK_HOURS` (entero de 1 a 720; por defecto 24). Debe conservarse la clave de firma para verificar firmas previas.

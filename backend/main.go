@@ -14,9 +14,11 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -43,13 +45,18 @@ var fase4Migration string
 //go:embed database/004_fase4_correcciones.sql
 var fase4CorrectionsMigration string
 
+//go:embed database/005_firmas_y_bloqueo.sql
+var signaturesMigration string
+
 var (
-	db       *sql.DB
-	clinicID int64
-	userID   int64
-	jwtKey   []byte
-	mfaKey   []byte
-	chairIDs = map[string]int64{}
+	db                 *sql.DB
+	clinicID           int64
+	userID             int64
+	jwtKey             []byte
+	mfaKey             []byte
+	clinicalSigningKey []byte
+	noteLockHours      int
+	chairIDs           = map[string]int64{}
 )
 
 type principal struct {
@@ -155,6 +162,16 @@ func main() {
 	}
 	jwtKey = []byte(secret)
 	mfaKey = deriveMFAKey(env("MFA_ENCRYPTION_KEY", "sigo-local-dev-mfa-encryption-key-change-before-production"))
+	signingSecret := env("CLINICAL_SIGNING_KEY", "sigo-local-dev-clinical-signing-key-change-before-production")
+	if len(signingSecret) < 32 {
+		log.Fatal("CLINICAL_SIGNING_KEY debe tener al menos 32 caracteres")
+	}
+	clinicalSigningKey = []byte(signingSecret)
+	var parseErr error
+	noteLockHours, parseErr = strconv.Atoi(env("CLINICAL_NOTE_LOCK_HOURS", "24"))
+	if parseErr != nil || noteLockHours < 1 || noteLockHours > 720 {
+		log.Fatal("CLINICAL_NOTE_LOCK_HOURS debe ser un entero entre 1 y 720")
+	}
 	var err error
 	url := env("DATABASE_URL", "postgres://sigo:sigo_local_dev_only@db:5432/sigodental?sslmode=disable")
 	db, err = sql.Open("pgx", url)
@@ -219,6 +236,7 @@ func main() {
 	mux.Handle("POST /api/patients/{patientID}/prescriptions", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(createPrescription)))
 	mux.Handle("GET /api/patients/{patientID}/consents", secure([]string{"admin_ti", "odontologo", "asistente"}, http.HandlerFunc(listConsents)))
 	mux.Handle("POST /api/patients/{patientID}/consents", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(createConsent)))
+	mux.Handle("POST /api/patients/{patientID}/consents/{consentID}/signature", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(signConsent)))
 	mux.HandleFunc("OPTIONS /", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
 	addr := ":" + env("PORT", "8080")
@@ -251,7 +269,7 @@ func bootstrap(ctx context.Context) error {
 	migrations := []struct {
 		name string
 		sql  string
-	}{{"Fase 3", fase3Migration}, {"Fase 4", fase4Migration}, {"Correcciones Fase 4", fase4CorrectionsMigration}}
+	}{{"Fase 3", fase3Migration}, {"Fase 4", fase4Migration}, {"Correcciones Fase 4", fase4CorrectionsMigration}, {"Firmas y bloqueo", signaturesMigration}}
 	for _, migration := range migrations {
 		for _, statement := range splitSQLStatements(migration.sql) {
 			if _, err := db.ExecContext(ctx, statement); err != nil {
@@ -486,22 +504,32 @@ func login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.Email = strings.ToLower(strings.TrimSpace(in.Email))
+	loginKey := "login:" + in.Email
+	if loginLimiter.blocked(loginKey, 5, 15*time.Minute) {
+		writeError(w, http.StatusTooManyRequests, "Demasiados intentos fallidos. Espera 15 minutos e inténtalo de nuevo.")
+		return
+	}
 	var p principal
 	var passwordHash string
 	var mfaEnabled bool
 	var encryptedSecret string
 	err := db.QueryRowContext(r.Context(), `SELECT u.id,cm.clinic_id,cm.role,u.full_name,u.email,u.password_hash,u.mfa_enabled,COALESCE(u.mfa_secret,'') FROM users u JOIN clinic_members cm ON cm.user_id=u.id WHERE lower(u.email)=lower($1) AND cm.clinic_id=$2 AND u.active AND cm.active`, in.Email, clinicID).Scan(&p.UserID, &p.ClinicID, &p.Role, &p.Name, &p.Email, &passwordHash, &mfaEnabled, &encryptedSecret)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
+		loginLimiter.fail(loginKey)
 		writeError(w, http.StatusUnauthorized, "Correo o contraseña incorrectos")
 		return
 	}
 	if mfaEnabled {
 		secret, decryptErr := decryptMFASecret(encryptedSecret)
 		if decryptErr != nil || !validTOTP(secret, in.Code, time.Now()) {
+			if strings.TrimSpace(in.Code) != "" {
+				loginLimiter.fail(loginKey)
+			}
 			writeJSON(w, http.StatusForbidden, map[string]any{"status": http.StatusForbidden, "message": "Ingresa el código de seis dígitos de tu aplicación autenticadora", "mfa_required": true})
 			return
 		}
 	}
+	loginLimiter.reset(loginKey)
 	issueSession(w, p, mfaEnabled)
 }
 
@@ -860,7 +888,9 @@ func createClinicalNote(w http.ResponseWriter, r *http.Request) {
 	}
 	var id int64
 	var created time.Time
-	err = tx.QueryRowContext(r.Context(), `INSERT INTO clinical_notes(encounter_id,author_id,subjective,objective,assessment,plan,signature_ref) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,created_at`, enc, actorID(r), in.Subjective, in.Objective, in.Assessment, in.Plan, fmt.Sprintf("session:%d", actorID(r))).Scan(&id, &created)
+	signedAt := time.Now().UTC().Truncate(time.Microsecond)
+	signature := clinicalNoteSignature("clinical-note", patientID, actorID(r), 0, in, signedAt)
+	err = tx.QueryRowContext(r.Context(), `INSERT INTO clinical_notes(encounter_id,author_id,subjective,objective,assessment,plan,signed_at,signature_ref) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,created_at`, enc, actorID(r), in.Subjective, in.Objective, in.Assessment, in.Plan, signedAt, signature).Scan(&id, &created)
 	if err != nil {
 		writeError(w, 500, "No se pudo guardar la nota")
 		return
@@ -871,7 +901,42 @@ func createClinicalNote(w http.ResponseWriter, r *http.Request) {
 	}
 	var author string
 	_ = db.QueryRowContext(r.Context(), `SELECT full_name FROM users WHERE id=$1`, actorID(r)).Scan(&author)
-	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "text": soapText(in), "date": created.Format("02/01/2006 15:04"), "author": author})
+	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "text": soapText(in), "date": created.Format("02/01/2006 15:04"), "author": author, "signedAt": signedAt, "lockedAt": signedAt.Add(time.Duration(noteLockHours) * time.Hour), "signatureType": "hmac-sha256"})
+}
+
+func clinicalSignature(payload string) string {
+	mac := hmac.New(sha256.New, clinicalSigningKey)
+	_, _ = mac.Write([]byte(payload))
+	return "hmac-sha256:v1:" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func clinicalNoteSignature(kind string, patientID, authorID, amendmentID int64, note soapInput, signedAt time.Time) string {
+	payload, _ := json.Marshal(struct {
+		Kind        string    `json:"kind"`
+		PatientID   int64     `json:"patientId"`
+		AuthorID    int64     `json:"authorId"`
+		AmendmentID int64     `json:"amendmentId"`
+		Subjective  string    `json:"subjective"`
+		Objective   string    `json:"objective"`
+		Assessment  string    `json:"assessment"`
+		Plan        string    `json:"plan"`
+		SignedAt    time.Time `json:"signedAt"`
+	}{kind, patientID, authorID, amendmentID, note.Subjective, note.Objective, note.Assessment, note.Plan, signedAt.UTC()})
+	return clinicalSignature(string(payload))
+}
+
+func consentRecordSignature(consentID, patientID int64, procedure, signer, role string, imageBytes []byte, signedAt time.Time) string {
+	digest := sha256.Sum256(imageBytes)
+	payload, _ := json.Marshal(struct {
+		ConsentID int64     `json:"consentId"`
+		PatientID int64     `json:"patientId"`
+		Procedure string    `json:"procedure"`
+		Signer    string    `json:"signer"`
+		Role      string    `json:"role"`
+		ImageHash string    `json:"imageHash"`
+		SignedAt  time.Time `json:"signedAt"`
+	}{consentID, patientID, procedure, signer, role, hex.EncodeToString(digest[:]), signedAt.UTC()})
+	return clinicalSignature(string(payload))
 }
 
 func createClinicalAmendment(w http.ResponseWriter, r *http.Request) {
@@ -909,7 +974,9 @@ func createClinicalAmendment(w http.ResponseWriter, r *http.Request) {
 	}
 	var id int64
 	var created time.Time
-	err = tx.QueryRowContext(r.Context(), `INSERT INTO clinical_notes(encounter_id,author_id,subjective,objective,assessment,plan,signature_ref,amendment_of) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,created_at`, encounterID, actorID(r), in.Subjective, in.Objective, in.Assessment, in.Plan, fmt.Sprintf("session:%d", actorID(r)), noteID).Scan(&id, &created)
+	signedAt := time.Now().UTC().Truncate(time.Microsecond)
+	signature := clinicalNoteSignature("clinical-amendment", patientID, actorID(r), noteID, in, signedAt)
+	err = tx.QueryRowContext(r.Context(), `INSERT INTO clinical_notes(encounter_id,author_id,subjective,objective,assessment,plan,signed_at,signature_ref,amendment_of) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,created_at`, encounterID, actorID(r), in.Subjective, in.Objective, in.Assessment, in.Plan, signedAt, signature, noteID).Scan(&id, &created)
 	if err != nil {
 		writeError(w, 500, "No se pudo guardar la adenda")
 		return
@@ -920,7 +987,7 @@ func createClinicalAmendment(w http.ResponseWriter, r *http.Request) {
 	}
 	var author string
 	_ = db.QueryRowContext(r.Context(), `SELECT full_name FROM users WHERE id=$1`, actorID(r)).Scan(&author)
-	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "amendmentOf": noteID, "text": "ADENDA A NOTA #" + strconv.FormatInt(noteID, 10) + "\n" + soapText(in), "date": created.Format("02/01/2006 15:04"), "author": author})
+	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "amendmentOf": noteID, "text": "ADENDA A NOTA #" + strconv.FormatInt(noteID, 10) + "\n" + soapText(in), "date": created.Format("02/01/2006 15:04"), "author": author, "signedAt": signedAt, "lockedAt": signedAt.Add(time.Duration(noteLockHours) * time.Hour), "signatureType": "hmac-sha256"})
 }
 
 func soapText(n soapInput) string {
@@ -937,7 +1004,7 @@ func listClinicalNotes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := db.QueryContext(r.Context(), `SELECT n.id,n.subjective,n.objective,n.assessment,n.plan,n.created_at,u.full_name FROM clinical_notes n JOIN encounters e ON e.id=n.encounter_id JOIN users u ON u.id=n.author_id WHERE e.patient_id=$1 ORDER BY n.created_at DESC`, id)
+	rows, err := db.QueryContext(r.Context(), `SELECT n.id,n.subjective,n.objective,n.assessment,n.plan,n.created_at,n.signed_at,n.author_id,u.full_name,n.signature_ref,n.amendment_of FROM clinical_notes n JOIN encounters e ON e.id=n.encounter_id JOIN users u ON u.id=n.author_id WHERE e.patient_id=$1 ORDER BY n.created_at DESC`, id)
 	if err != nil {
 		writeError(w, 500, "No se pudieron cargar las notas")
 		return
@@ -947,13 +1014,21 @@ func listClinicalNotes(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var n soapInput
 		var nid int64
-		var at time.Time
+		var authorID int64
+		var at, signedAt time.Time
 		var author string
-		if rows.Scan(&nid, &n.Subjective, &n.Objective, &n.Assessment, &n.Plan, &at, &author) != nil {
+		var signature string
+		var amendmentOf sql.NullInt64
+		if rows.Scan(&nid, &n.Subjective, &n.Objective, &n.Assessment, &n.Plan, &at, &signedAt, &authorID, &author, &signature, &amendmentOf) != nil {
 			writeError(w, 500, "No se pudieron leer las notas")
 			return
 		}
-		out = append(out, map[string]any{"id": nid, "patient": id, "text": soapText(n), "date": at.Format("02/01/2006 15:04"), "author": author})
+		kind, amendmentID := "clinical-note", int64(0)
+		if amendmentOf.Valid {
+			kind, amendmentID = "clinical-amendment", amendmentOf.Int64
+		}
+		validSignature := hmac.Equal([]byte(signature), []byte(clinicalNoteSignature(kind, id, authorID, amendmentID, n, signedAt)))
+		out = append(out, map[string]any{"id": nid, "patient": id, "text": soapText(n), "date": at.Format("02/01/2006 15:04"), "author": author, "signedAt": signedAt, "lockedAt": signedAt.Add(time.Duration(noteLockHours) * time.Hour), "signatureType": "hmac-sha256", "signed": validSignature, "signatureVerified": validSignature, "amendmentOf": amendmentOf.Int64})
 	}
 	writeJSON(w, 200, out)
 }
@@ -1314,7 +1389,7 @@ func listConsents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := db.QueryContext(r.Context(), `SELECT id,procedure_name,status,created_at FROM informed_consents WHERE patient_id=$1 ORDER BY created_at DESC`, id)
+	rows, err := db.QueryContext(r.Context(), `SELECT id,procedure_name,status,created_at,COALESCE(signer_name,''),COALESCE(signer_role,''),COALESCE(signature_ref,''),signed_at FROM informed_consents WHERE patient_id=$1 ORDER BY created_at DESC`, id)
 	if err != nil {
 		writeError(w, 500, "No se pudieron cargar los consentimientos")
 		return
@@ -1323,9 +1398,11 @@ func listConsents(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var i int64
-		var proc, status string
+		var proc, status, signer string
+		var signerRole, signatureRef string
 		var at time.Time
-		if rows.Scan(&i, &proc, &status, &at) != nil {
+		var signedAt sql.NullTime
+		if rows.Scan(&i, &proc, &status, &at, &signer, &signerRole, &signatureRef, &signedAt) != nil {
 			continue
 		}
 		label := "Pendiente de firma"
@@ -1335,7 +1412,17 @@ func listConsents(w http.ResponseWriter, r *http.Request) {
 		if status == "declined" {
 			label = "Rechazado"
 		}
-		out = append(out, map[string]any{"id": i, "patient": id, "procedure": proc, "state": label, "date": at.Format("02/01/2006")})
+		validSignature := false
+		if signedAt.Valid {
+			parts := strings.SplitN(signatureRef, "\n", 2)
+			if len(parts) == 2 && strings.HasPrefix(parts[0], "data:image/png;base64,") {
+				imageBytes, decodeErr := base64.StdEncoding.DecodeString(strings.TrimPrefix(parts[0], "data:image/png;base64,"))
+				if decodeErr == nil {
+					validSignature = hmac.Equal([]byte(parts[1]), []byte(consentRecordSignature(i, id, proc, signer, signerRole, imageBytes, signedAt.Time)))
+				}
+			}
+		}
+		out = append(out, map[string]any{"id": i, "patient": id, "procedure": proc, "state": label, "date": at.Format("02/01/2006"), "signer": signer, "hasSignature": status == "signed" && signatureRef != "", "signatureVerified": validSignature})
 	}
 	writeJSON(w, 200, out)
 }
@@ -1372,6 +1459,86 @@ func createConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "procedure": in.Procedure, "state": "Pendiente de firma", "date": at.Format("02/01/2006")})
+}
+
+type consentSignatureInput struct {
+	SignerName string `json:"signerName"`
+	SignerRole string `json:"signerRole"`
+	Signature  string `json:"signature"`
+}
+
+func signConsent(w http.ResponseWriter, r *http.Request) {
+	patientID, ok := clinicalPatientID(w, r)
+	if !ok {
+		return
+	}
+	consentID, err := strconv.ParseInt(r.PathValue("consentID"), 10, 64)
+	if err != nil || consentID < 1 {
+		writeError(w, http.StatusBadRequest, "Consentimiento inválido")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 100*1024))
+	if err != nil || len(body) >= 100*1024 {
+		writeError(w, http.StatusRequestEntityTooLarge, "La firma excede el tamaño permitido")
+		return
+	}
+	var in consentSignatureInput
+	if json.Unmarshal(body, &in) != nil {
+		writeError(w, http.StatusBadRequest, "Datos de firma inválidos")
+		return
+	}
+	in.SignerName = strings.TrimSpace(in.SignerName)
+	in.SignerRole = strings.TrimSpace(in.SignerRole)
+	const pngPrefix = "data:image/png;base64,"
+	if in.SignerName == "" || (in.SignerRole != "patient" && in.SignerRole != "guardian") || !strings.HasPrefix(in.Signature, pngPrefix) {
+		writeError(w, http.StatusBadRequest, "Indica el nombre, relación del firmante y firma dibujada")
+		return
+	}
+	imageBytes, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(in.Signature, pngPrefix))
+	if err != nil || len(imageBytes) < 16 || len(imageBytes) > 64*1024 || !strings.HasPrefix(string(imageBytes), "\x89PNG\r\n\x1a\n") {
+		writeError(w, http.StatusBadRequest, "La imagen de firma no es un PNG válido o supera el tamaño permitido")
+		return
+	}
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "No se pudo iniciar la firma")
+		return
+	}
+	defer tx.Rollback()
+	var age int
+	var guardian string
+	if err = tx.QueryRowContext(r.Context(), `SELECT COALESCE(EXTRACT(YEAR FROM age(CURRENT_DATE,birth_date))::int,age_years,0),COALESCE((SELECT full_name FROM patient_guardians g WHERE g.patient_id=p.id AND g.legal_guardian ORDER BY g.id DESC LIMIT 1),'') FROM patients p WHERE p.id=$1 AND p.clinic_id=$2 AND p.active`, patientID, clinicID).Scan(&age, &guardian); err != nil {
+		writeError(w, http.StatusNotFound, "Paciente no encontrado")
+		return
+	}
+	if age < 18 && (in.SignerRole != "guardian" || !strings.EqualFold(in.SignerName, guardian)) {
+		writeError(w, http.StatusBadRequest, "Para un paciente menor de edad debe firmar el tutor legal registrado")
+		return
+	}
+	if age >= 18 && in.SignerRole != "patient" {
+		writeError(w, http.StatusBadRequest, "El paciente adulto debe firmar su propio consentimiento")
+		return
+	}
+	var procedure string
+	if err = tx.QueryRowContext(r.Context(), `SELECT procedure_name FROM informed_consents WHERE id=$1 AND patient_id=$2 AND status='pending' FOR UPDATE`, consentID, patientID).Scan(&procedure); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusConflict, "El consentimiento no existe o ya fue firmado")
+		} else {
+			writeError(w, 500, "No se pudo cargar el consentimiento")
+		}
+		return
+	}
+	signedAt := time.Now().UTC().Truncate(time.Microsecond)
+	signatureRef := in.Signature + "\n" + consentRecordSignature(consentID, patientID, procedure, in.SignerName, in.SignerRole, imageBytes, signedAt)
+	if _, err = tx.ExecContext(r.Context(), `UPDATE informed_consents SET status='signed',signer_name=$1,signer_role=$2,signature_ref=$3,signed_at=$4 WHERE id=$5 AND patient_id=$6 AND status='pending'`, in.SignerName, in.SignerRole, signatureRef, signedAt, consentID, patientID); err != nil {
+		writeError(w, 500, "No se pudo registrar la firma")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, 500, "No se pudo confirmar la firma")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": consentID, "patient": patientID, "procedure": procedure, "state": "Firmado", "signer": in.SignerName, "signedAt": signedAt, "signatureType": "captured-electronic-hmac-sha256", "signatureVerified": true})
 }
 
 func listPatients(w http.ResponseWriter, r *http.Request) {

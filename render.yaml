@@ -20,6 +20,10 @@ services:
         generateValue: true
       - key: MFA_ENCRYPTION_KEY
         generateValue: true
+      - key: CLINICAL_SIGNING_KEY
+        generateValue: true
+      - key: CLINICAL_NOTE_LOCK_HOURS
+        value: "24"
       - key: CORS_ORIGINS
         value: https://*.onrender.com
 

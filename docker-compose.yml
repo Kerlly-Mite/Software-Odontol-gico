@@ -29,6 +29,8 @@ services:
       PORT: 8080
       JWT_SECRET: ${JWT_SECRET:-sigo-local-dev-jwt-secret-change-before-production-2026}
       MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-sigo-local-dev-mfa-encryption-key-change-before-production}
+      CLINICAL_SIGNING_KEY: ${CLINICAL_SIGNING_KEY:-sigo-local-dev-clinical-signing-key-change-before-production}
+      CLINICAL_NOTE_LOCK_HOURS: ${CLINICAL_NOTE_LOCK_HOURS:-24}
     depends_on:
       db:
         condition: service_healthy
