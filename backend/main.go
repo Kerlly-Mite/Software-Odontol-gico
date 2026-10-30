@@ -31,11 +31,17 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+//go:embed database/001_fases_1_2.sql
+var baseSchemaMigration string
+
 //go:embed database/002_fase3.sql
 var fase3Migration string
 
 //go:embed database/003_fase4.sql
 var fase4Migration string
+
+//go:embed database/004_fase4_correcciones.sql
+var fase4CorrectionsMigration string
 
 var (
 	db       *sql.DB
@@ -74,9 +80,12 @@ type Patient struct {
 	Name       string `json:"name"`
 	Doc        string `json:"doc"`
 	Age        int    `json:"age"`
+	Birth      string `json:"birth"`
 	Phone      string `json:"phone"`
+	Emergency  string `json:"emergency"`
 	Email      string `json:"email"`
 	Blood      string `json:"blood"`
+	Guardian   string `json:"guardian"`
 	Allergies  string `json:"allergies"`
 	Conditions string `json:"conditions"`
 	Insurance  string `json:"insurance"`
@@ -120,13 +129,14 @@ type PatientInput struct {
 }
 
 type AppointmentInput struct {
-	Patient   string `json:"patient"`
-	Doctor    string `json:"doctor"`
-	Procedure string `json:"procedure"`
-	Date      string `json:"date"`
-	Time      string `json:"time"`
-	Chair     string `json:"chair"`
-	Status    string `json:"status"`
+	Patient    string `json:"patient"`
+	Doctor     string `json:"doctor"`
+	Procedure  string `json:"procedure"`
+	PlanItemID int64  `json:"planItemId"`
+	Date       string `json:"date"`
+	Time       string `json:"time"`
+	Chair      string `json:"chair"`
+	Status     string `json:"status"`
 }
 
 type InvoiceInput struct {
@@ -177,6 +187,11 @@ func main() {
 	mux.Handle("POST /api/auth/mfa/verify-setup", secureSetup([]string{"admin_ti", "recepcionista", "odontologo", "asistente", "auditor"}, http.HandlerFunc(verifyMFASetup)))
 	mux.Handle("GET /api/patients", secure([]string{"admin_ti", "recepcionista", "odontologo", "asistente"}, http.HandlerFunc(listPatients)))
 	mux.Handle("POST /api/patients", secure([]string{"admin_ti", "recepcionista"}, http.HandlerFunc(createPatient)))
+	mux.Handle("PUT /api/patients/{patientID}", secure([]string{"admin_ti", "recepcionista"}, http.HandlerFunc(updatePatient)))
+	mux.Handle("GET /api/treatment-plans", secure([]string{"admin_ti", "recepcionista", "odontologo", "asistente", "auditor"}, http.HandlerFunc(listTreatmentPlans)))
+	mux.Handle("POST /api/treatment-plans", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(createTreatmentPlan)))
+	mux.Handle("POST /api/treatment-plans/{id}/approval", secure([]string{"admin_ti", "recepcionista", "odontologo"}, http.HandlerFunc(approveTreatmentPlan)))
+	mux.Handle("POST /api/cash/close", secure([]string{"admin_ti", "recepcionista"}, http.HandlerFunc(closeCash)))
 	mux.Handle("GET /api/appointments", secure([]string{"admin_ti", "recepcionista", "odontologo", "asistente"}, http.HandlerFunc(listAppointments)))
 	mux.Handle("POST /api/appointments", secure([]string{"admin_ti", "recepcionista", "odontologo"}, http.HandlerFunc(createAppointment)))
 	mux.Handle("PATCH /api/appointments/{id}/status", secure([]string{"admin_ti", "recepcionista", "odontologo"}, http.HandlerFunc(updateAppointmentStatus)))
@@ -195,6 +210,7 @@ func main() {
 	mux.Handle("GET /api/reports/summary", secure([]string{"admin_ti", "auditor"}, http.HandlerFunc(reportSummary)))
 	mux.Handle("GET /api/patients/{patientID}/clinical-notes", secure([]string{"admin_ti", "odontologo", "asistente"}, http.HandlerFunc(listClinicalNotes)))
 	mux.Handle("POST /api/patients/{patientID}/clinical-notes", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(createClinicalNote)))
+	mux.Handle("POST /api/patients/{patientID}/clinical-notes/{noteID}/amendments", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(createClinicalAmendment)))
 	mux.Handle("GET /api/patients/{patientID}/odontograms", secure([]string{"admin_ti", "odontologo", "asistente"}, http.HandlerFunc(getOdontogram)))
 	mux.Handle("POST /api/patients/{patientID}/odontograms", secure([]string{"admin_ti", "odontologo"}, http.HandlerFunc(saveOdontogram)))
 	mux.Handle("GET /api/patients/{patientID}/periodontogram", secure([]string{"admin_ti", "odontologo", "asistente"}, http.HandlerFunc(getPeriodontogram)))
@@ -213,13 +229,33 @@ func main() {
 // bootstrap adds compatibility columns for databases created by the first prototype
 // and creates the local clinic/user/operatory records needed by these dev endpoints.
 func bootstrap(ctx context.Context) error {
-	for i, migration := range []string{fase3Migration, fase4Migration} {
-		for _, statement := range strings.Split(migration, ";") {
-			if strings.TrimSpace(statement) == "" {
-				continue
+	var schemaExists bool
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('public.clinics') IS NOT NULL`).Scan(&schemaExists); err != nil {
+		return fmt.Errorf("no se pudo verificar el esquema inicial: %w", err)
+	}
+	if !schemaExists {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("no se pudo iniciar el esquema inicial: %w", err)
+		}
+		for _, statement := range splitSQLStatements(baseSchemaMigration) {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("esquema inicial: %w", err)
 			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("no se pudo confirmar el esquema inicial: %w", err)
+		}
+	}
+	migrations := []struct {
+		name string
+		sql  string
+	}{{"Fase 3", fase3Migration}, {"Fase 4", fase4Migration}, {"Correcciones Fase 4", fase4CorrectionsMigration}}
+	for _, migration := range migrations {
+		for _, statement := range splitSQLStatements(migration.sql) {
 			if _, err := db.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("migración Fase %d: %w", i+3, err)
+				return fmt.Errorf("migración %s: %w", migration.name, err)
 			}
 		}
 	}
@@ -276,6 +312,127 @@ func bootstrap(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// splitSQLStatements splits at semicolons outside quoted strings, comments, and
+// PostgreSQL dollar-quoted procedure bodies.
+func splitSQLStatements(script string) []string {
+	statements := make([]string, 0)
+	start := 0
+	var dollarTag string
+	var singleQuoted, doubleQuoted, lineComment, blockComment bool
+	for i := 0; i < len(script); {
+		if dollarTag != "" {
+			if strings.HasPrefix(script[i:], dollarTag) {
+				i += len(dollarTag)
+				dollarTag = ""
+			} else {
+				i++
+			}
+			continue
+		}
+		if lineComment {
+			if script[i] == '\n' {
+				lineComment = false
+			}
+			i++
+			continue
+		}
+		if blockComment {
+			if i+1 < len(script) && script[i] == '*' && script[i+1] == '/' {
+				blockComment = false
+				i += 2
+			} else {
+				i++
+			}
+			continue
+		}
+		if singleQuoted {
+			if script[i] == '\'' {
+				if i+1 < len(script) && script[i+1] == '\'' {
+					i += 2
+				} else {
+					singleQuoted = false
+					i++
+				}
+			} else {
+				i++
+			}
+			continue
+		}
+		if doubleQuoted {
+			if script[i] == '"' {
+				if i+1 < len(script) && script[i+1] == '"' {
+					i += 2
+				} else {
+					doubleQuoted = false
+					i++
+				}
+			} else {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(script) && script[i] == '-' && script[i+1] == '-' {
+			lineComment = true
+			i += 2
+			continue
+		}
+		if i+1 < len(script) && script[i] == '/' && script[i+1] == '*' {
+			blockComment = true
+			i += 2
+			continue
+		}
+		switch script[i] {
+		case '\'':
+			singleQuoted = true
+			i++
+		case '"':
+			doubleQuoted = true
+			i++
+		case '$':
+			if tagEnd := dollarQuoteTagEnd(script, i); tagEnd > i {
+				dollarTag = script[i:tagEnd]
+				i = tagEnd
+			} else {
+				i++
+			}
+		case ';':
+			if statement := strings.TrimSpace(script[start : i+1]); statement != "" {
+				statements = append(statements, statement)
+			}
+			i++
+			start = i
+		default:
+			i++
+		}
+	}
+	if statement := strings.TrimSpace(script[start:]); statement != "" {
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
+func dollarQuoteTagEnd(script string, start int) int {
+	if start+1 >= len(script) {
+		return 0
+	}
+	if script[start+1] == '$' {
+		return start + 2
+	}
+	if !((script[start+1] >= 'a' && script[start+1] <= 'z') || (script[start+1] >= 'A' && script[start+1] <= 'Z') || script[start+1] == '_') {
+		return 0
+	}
+	for i := start + 2; i < len(script); i++ {
+		c := script[i]
+		if c == '$' {
+			return i + 1
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return 0
+		}
+	}
+	return 0
 }
 
 func ensureDemoUser(ctx context.Context, email, name, role string) (int64, error) {
@@ -716,6 +873,56 @@ func createClinicalNote(w http.ResponseWriter, r *http.Request) {
 	_ = db.QueryRowContext(r.Context(), `SELECT full_name FROM users WHERE id=$1`, actorID(r)).Scan(&author)
 	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "text": soapText(in), "date": created.Format("02/01/2006 15:04"), "author": author})
 }
+
+func createClinicalAmendment(w http.ResponseWriter, r *http.Request) {
+	patientID, ok := clinicalPatientID(w, r)
+	if !ok {
+		return
+	}
+	noteID, err := strconv.ParseInt(r.PathValue("noteID"), 10, 64)
+	if err != nil || noteID < 1 {
+		writeError(w, 400, "Nota original inválida")
+		return
+	}
+	var in soapInput
+	if !decode(w, r, &in) {
+		return
+	}
+	if strings.TrimSpace(soapText(in)) == "" {
+		writeError(w, 400, "La adenda debe incluir al menos un cambio o aclaración")
+		return
+	}
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "No se pudo iniciar la adenda")
+		return
+	}
+	defer tx.Rollback()
+	var encounterID int64
+	if err = tx.QueryRowContext(r.Context(), `SELECT n.encounter_id FROM clinical_notes n JOIN encounters e ON e.id=n.encounter_id WHERE n.id=$1 AND e.patient_id=$2 FOR SHARE`, noteID, patientID).Scan(&encounterID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, 404, "La nota original no pertenece a este paciente")
+		} else {
+			writeError(w, 500, "No se pudo consultar la nota original")
+		}
+		return
+	}
+	var id int64
+	var created time.Time
+	err = tx.QueryRowContext(r.Context(), `INSERT INTO clinical_notes(encounter_id,author_id,subjective,objective,assessment,plan,signature_ref,amendment_of) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,created_at`, encounterID, actorID(r), in.Subjective, in.Objective, in.Assessment, in.Plan, fmt.Sprintf("session:%d", actorID(r)), noteID).Scan(&id, &created)
+	if err != nil {
+		writeError(w, 500, "No se pudo guardar la adenda")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, 500, "No se pudo confirmar la adenda")
+		return
+	}
+	var author string
+	_ = db.QueryRowContext(r.Context(), `SELECT full_name FROM users WHERE id=$1`, actorID(r)).Scan(&author)
+	writeJSON(w, 201, map[string]any{"id": id, "patient": patientID, "amendmentOf": noteID, "text": "ADENDA A NOTA #" + strconv.FormatInt(noteID, 10) + "\n" + soapText(in), "date": created.Format("02/01/2006 15:04"), "author": author})
+}
+
 func soapText(n soapInput) string {
 	parts := []string{}
 	for _, p := range []struct{ k, v string }{{"SUBJETIVO", n.Subjective}, {"OBJETIVO", n.Objective}, {"EVALUACIÓN", n.Assessment}, {"PLAN", n.Plan}} {
@@ -798,6 +1005,16 @@ func getOdontogram(w http.ResponseWriter, r *http.Request) {
 			tooth[strconv.Itoa(n)] = "endodoncia"
 		case "missing":
 			tooth[strconv.Itoa(n)] = "ausente"
+		case "implant":
+			tooth[strconv.Itoa(n)] = "implante"
+		case "fixed_prosthesis":
+			tooth[strconv.Itoa(n)] = "protesis-fija"
+		case "removable_prosthesis":
+			tooth[strconv.Itoa(n)] = "protesis-removible"
+		case "extraction":
+			tooth[strconv.Itoa(n)] = "exodoncia"
+		case "sealant":
+			tooth[strconv.Itoa(n)] = "sellante"
 		case "other":
 			if strings.HasPrefix(note.String, "surface:") {
 				surface[strconv.Itoa(n)+"-"+strings.TrimPrefix(note.String, "surface:")] = true
@@ -808,6 +1025,11 @@ func getOdontogram(w http.ResponseWriter, r *http.Request) {
 		dent = "Temporal"
 	} else {
 		dent = "Permanente"
+	}
+	if notation == "universal" {
+		notation = "Universal"
+	} else {
+		notation = "FDI"
 	}
 	writeJSON(w, 200, map[string]any{"dentition": dent, "notation": notation, "toothStatus": tooth, "surfaceStatus": surface})
 }
@@ -836,19 +1058,29 @@ func saveOdontogram(w http.ResponseWriter, r *http.Request) {
 	if in.Dentition == "Temporal" {
 		dent = "primary"
 	}
+	notation := "FDI"
+	if strings.EqualFold(in.Notation, "universal") {
+		notation = "universal"
+	} else if in.Notation != "" && !strings.EqualFold(in.Notation, "FDI") {
+		writeError(w, 400, "Notación odontológica inválida")
+		return
+	}
 	var oid int64
-	if err = tx.QueryRowContext(r.Context(), `INSERT INTO odontograms(encounter_id,provider_id,dentition,notation) VALUES($1,$2,$3,$4) RETURNING id`, enc, actorID(r), dent, "FDI").Scan(&oid); err != nil {
+	if err = tx.QueryRowContext(r.Context(), `INSERT INTO odontograms(encounter_id,provider_id,dentition,notation) VALUES($1,$2,$3,$4) RETURNING id`, enc, actorID(r), dent, notation).Scan(&oid); err != nil {
 		writeError(w, 500, "No se pudo guardar el odontograma")
 		return
 	}
 	for k, v := range in.ToothStatus {
 		n, e := strconv.Atoi(k)
-		f := map[string]string{"caries": "caries", "restaurado": "restoration", "endodoncia": "endodontics", "ausente": "missing"}[v]
-		if e == nil && n > 0 && f != "" {
-			if _, err = tx.ExecContext(r.Context(), `INSERT INTO tooth_findings(odontogram_id,tooth_number,surface,finding) VALUES($1,$2,'whole_tooth',$3)`, oid, n, f); err != nil {
-				writeError(w, 500, "Hallazgo dental inválido")
-				return
-			}
+		f := map[string]string{"caries": "caries", "restaurado": "restoration", "endodoncia": "endodontics", "implante": "implant", "protesis-fija": "fixed_prosthesis", "protesis-removible": "removable_prosthesis", "exodoncia": "extraction", "sellante": "sealant", "ausente": "missing"}[v]
+		valid := validFDITooth(n, dent)
+		if e != nil || !valid || f == "" {
+			writeError(w, 400, "Diente o hallazgo odontológico inválido")
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO tooth_findings(odontogram_id,tooth_number,surface,finding) VALUES($1,$2,'whole_tooth',$3)`, oid, n, f); err != nil {
+			writeError(w, 500, "Hallazgo dental inválido")
+			return
 		}
 	}
 	surfaceMap := map[string]string{"V": "vestibular", "P": "palatal", "M": "mesial", "D": "distal", "O": "occlusal"}
@@ -862,7 +1094,7 @@ func saveOdontogram(w http.ResponseWriter, r *http.Request) {
 		}
 		n, e := strconv.Atoi(parts[0])
 		s := surfaceMap[parts[1]]
-		if e == nil && s != "" {
+		if e == nil && validFDITooth(n, dent) && s != "" {
 			if _, err = tx.ExecContext(r.Context(), `INSERT INTO tooth_findings(odontogram_id,tooth_number,surface,finding,note) VALUES($1,$2,$3,'other',$4)`, oid, n, s, "surface:"+parts[1]); err != nil {
 				writeError(w, 500, "Superficie dental inválida")
 				return
@@ -876,8 +1108,23 @@ func saveOdontogram(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{"saved": true})
 }
 
+func validFDITooth(number int, dentition string) bool {
+	if dentition == "permanent" {
+		return number >= 11 && number <= 18 || number >= 21 && number <= 28 || number >= 31 && number <= 38 || number >= 41 && number <= 48
+	}
+	return number >= 51 && number <= 55 || number >= 61 && number <= 65 || number >= 71 && number <= 75 || number >= 81 && number <= 85
+}
+
 type periodInput struct {
-	Readings map[string]string `json:"readings"`
+	Readings map[string]periodReadingInput `json:"readings"`
+}
+
+type periodReadingInput struct {
+	Depth     float64  `json:"depth"`
+	Margin    *float64 `json:"margin"`
+	Bleeding  bool     `json:"bleeding"`
+	Mobility  *int     `json:"mobility"`
+	Furcation *int     `json:"furcation"`
 }
 
 var periodSites = map[string]string{"v-m": "mesiobuccal", "v-c": "midbuccal", "v-d": "distobuccal", "l-m": "mesiolingual", "l-c": "midlingual", "l-d": "distolingual"}
@@ -887,18 +1134,21 @@ func getPeriodontogram(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := db.QueryContext(r.Context(), `SELECT p.tooth_number,p.site,p.probing_depth_mm FROM periodontal_readings p JOIN encounters e ON e.id=p.encounter_id WHERE e.patient_id=$1 ORDER BY p.recorded_at DESC`, id)
+	rows, err := db.QueryContext(r.Context(), `SELECT p.tooth_number,p.site,p.probing_depth_mm,p.gingival_margin_mm,p.bleeding,p.mobility,p.furcation FROM periodontal_readings p JOIN encounters e ON e.id=p.encounter_id WHERE e.patient_id=$1 ORDER BY p.recorded_at DESC`, id)
 	if err != nil {
 		writeError(w, 500, "No se pudo cargar el periodontograma")
 		return
 	}
 	defer rows.Close()
-	readings := map[string]string{}
+	readings := map[string]map[string]any{}
 	for rows.Next() {
 		var n int
 		var site string
 		var depth float64
-		if rows.Scan(&n, &site, &depth) != nil {
+		var margin sql.NullFloat64
+		var bleeding bool
+		var mobility, furcation sql.NullInt64
+		if rows.Scan(&n, &site, &depth, &margin, &bleeding, &mobility, &furcation) != nil {
 			continue
 		}
 		side, part := "", ""
@@ -918,7 +1168,19 @@ func getPeriodontogram(w http.ResponseWriter, r *http.Request) {
 		}
 		k := strconv.Itoa(n) + "-" + side + "-" + part
 		if _, ok := readings[k]; !ok {
-			readings[k] = strconv.FormatFloat(depth, 'f', -1, 64)
+			attachment := depth
+			var marginValue, mobilityValue, furcationValue any
+			if margin.Valid {
+				marginValue = margin.Float64
+				attachment += margin.Float64
+			}
+			if mobility.Valid {
+				mobilityValue = mobility.Int64
+			}
+			if furcation.Valid {
+				furcationValue = furcation.Int64
+			}
+			readings[k] = map[string]any{"depth": depth, "margin": marginValue, "bleeding": bleeding, "mobility": mobilityValue, "furcation": furcationValue, "nic": attachment}
 		}
 	}
 	writeJSON(w, 200, map[string]any{"readings": readings})
@@ -944,19 +1206,29 @@ func savePeriodontogram(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "No se pudo crear la atención")
 		return
 	}
-	for k, val := range in.Readings {
+	for k, reading := range in.Readings {
 		p := strings.Split(k, "-")
 		if len(p) != 3 {
 			continue
 		}
 		n, e := strconv.Atoi(p[0])
-		depth, e2 := strconv.ParseFloat(val, 64)
+		depth := reading.Depth
 		site := periodSites[p[1]+"-"+p[2]]
-		if e != nil || e2 != nil || n < 1 || site == "" || depth < 0 || depth > 15 {
+		if e != nil || n < 1 || site == "" || depth < 0 || depth > 15 || (reading.Margin != nil && (*reading.Margin < -15 || *reading.Margin > 15)) || (reading.Mobility != nil && (*reading.Mobility < 0 || *reading.Mobility > 3)) || (reading.Furcation != nil && (*reading.Furcation < 0 || *reading.Furcation > 3)) {
 			writeError(w, 400, "Una medición periodontal está fuera de rango")
 			return
 		}
-		_, err = tx.ExecContext(r.Context(), `INSERT INTO periodontal_readings(encounter_id,tooth_number,site,probing_depth_mm,recorded_by) VALUES($1,$2,$3,$4,$5) ON CONFLICT(encounter_id,tooth_number,site) DO UPDATE SET probing_depth_mm=EXCLUDED.probing_depth_mm,recorded_by=EXCLUDED.recorded_by,recorded_at=now()`, enc, n, site, depth, actorID(r))
+		var margin, mobility, furcation any
+		if reading.Margin != nil {
+			margin = *reading.Margin
+		}
+		if reading.Mobility != nil {
+			mobility = *reading.Mobility
+		}
+		if reading.Furcation != nil {
+			furcation = *reading.Furcation
+		}
+		_, err = tx.ExecContext(r.Context(), `INSERT INTO periodontal_readings(encounter_id,tooth_number,site,probing_depth_mm,gingival_margin_mm,bleeding,mobility,furcation,recorded_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(encounter_id,tooth_number,site) DO UPDATE SET probing_depth_mm=EXCLUDED.probing_depth_mm,gingival_margin_mm=EXCLUDED.gingival_margin_mm,bleeding=EXCLUDED.bleeding,mobility=EXCLUDED.mobility,furcation=EXCLUDED.furcation,recorded_by=EXCLUDED.recorded_by,recorded_at=now()`, enc, n, site, depth, margin, reading.Bleeding, mobility, furcation, actorID(r))
 		if err != nil {
 			writeError(w, 500, "No se pudo guardar una medición")
 			return
@@ -1105,8 +1377,9 @@ func createConsent(w http.ResponseWriter, r *http.Request) {
 func listPatients(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.QueryContext(r.Context(), `
 		SELECT p.id, p.given_names || ' ' || p.family_names, p.national_id,
-		       COALESCE(EXTRACT(YEAR FROM age(CURRENT_DATE, p.birth_date))::int, p.age_years::int, 0),
-		       COALESCE(p.phone,''), COALESCE(p.email,''), COALESCE(p.blood_type,''),
+		       COALESCE(EXTRACT(YEAR FROM age(CURRENT_DATE, p.birth_date))::int, p.age_years::int, 0), COALESCE(to_char(p.birth_date,'YYYY-MM-DD'),''),
+		       COALESCE(p.phone,''),COALESCE(p.emergency_contact,''), COALESCE(p.email,''), COALESCE(p.blood_type,''),
+		       COALESCE((SELECT full_name FROM patient_guardians g WHERE g.patient_id=p.id AND g.legal_guardian ORDER BY g.id DESC LIMIT 1),''),
 		       COALESCE((SELECT string_agg(description, ', ') FROM medical_alerts WHERE patient_id=p.id AND active AND category='allergy'), 'Ninguna conocida'),
 		       COALESCE((SELECT string_agg(description, ', ') FROM medical_alerts WHERE patient_id=p.id AND active AND category IN ('condition','medication','surgery','coagulation','other')), 'Ninguna'),
 		       COALESCE(p.insurance_name,'Particular'),
@@ -1120,7 +1393,7 @@ func listPatients(w http.ResponseWriter, r *http.Request) {
 	result := make([]Patient, 0)
 	for rows.Next() {
 		var p Patient
-		if err := rows.Scan(&p.ID, &p.Name, &p.Doc, &p.Age, &p.Phone, &p.Email, &p.Blood, &p.Allergies, &p.Conditions, &p.Insurance, &p.Last); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Doc, &p.Age, &p.Birth, &p.Phone, &p.Emergency, &p.Email, &p.Blood, &p.Guardian, &p.Allergies, &p.Conditions, &p.Insurance, &p.Last); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -1185,7 +1458,343 @@ func createPatient(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, Patient{ID: id, Name: in.Name, Doc: in.Doc, Age: in.Age, Phone: in.Phone, Email: in.Email, Blood: in.Blood, Allergies: fallback(in.Allergies, "Ninguna conocida"), Conditions: fallback(in.Conditions, "Ninguna"), Insurance: fallback(in.Insurance, "Particular"), Last: "Sin visitas"})
+	writeJSON(w, http.StatusCreated, Patient{ID: id, Name: in.Name, Doc: in.Doc, Age: in.Age, Birth: in.Birth, Phone: in.Phone, Emergency: in.Emergency, Email: in.Email, Blood: in.Blood, Guardian: in.Guardian, Allergies: fallback(in.Allergies, "Ninguna conocida"), Conditions: fallback(in.Conditions, "Ninguna"), Insurance: fallback(in.Insurance, "Particular"), Last: "Sin visitas"})
+}
+
+func updatePatient(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("patientID"), 10, 64)
+	if err != nil || id < 1 {
+		writeError(w, http.StatusBadRequest, "Identificador de paciente inválido")
+		return
+	}
+	var in PatientInput
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Name, in.Doc = strings.TrimSpace(in.Name), strings.TrimSpace(in.Doc)
+	if in.Name == "" || in.Doc == "" || in.Age < 0 || in.Age > 125 {
+		writeError(w, http.StatusBadRequest, "Nombre, identificación y edad válida son obligatorios")
+		return
+	}
+	parts := strings.Fields(in.Name)
+	given, family := strings.Join(parts, " "), "Sin apellido"
+	if len(parts) > 1 {
+		given, family = strings.Join(parts[:len(parts)-1], " "), parts[len(parts)-1]
+	}
+	var birth any
+	if in.Birth != "" {
+		parsed, parseErr := time.Parse("2006-01-02", in.Birth)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "Fecha de nacimiento inválida")
+			return
+		}
+		birth = parsed
+	}
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "No se pudo iniciar la actualización")
+		return
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(r.Context(), `UPDATE patients SET national_id=$1,given_names=$2,family_names=$3,birth_date=$4,age_years=$5,phone=$6,email=$7,emergency_contact=$8,blood_type=NULLIF($9,''),insurance_name=$10,updated_at=now() WHERE id=$11 AND clinic_id=$12 AND active`, in.Doc, given, family, birth, in.Age, in.Phone, in.Email, in.Emergency, in.Blood, in.Insurance, id, clinicID)
+	if err != nil {
+		writeError(w, http.StatusConflict, "No se pudo actualizar: verifica que la identificación no esté duplicada")
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		writeError(w, http.StatusNotFound, "Paciente no encontrado")
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `UPDATE medical_alerts SET active=FALSE WHERE patient_id=$1 AND active`, id); err != nil {
+		writeError(w, http.StatusInternalServerError, "No se pudieron actualizar las alertas")
+		return
+	}
+	for _, alert := range []struct{ category, value string }{{"allergy", in.Allergies}, {"condition", in.Conditions}} {
+		value := strings.TrimSpace(alert.value)
+		if value == "" || strings.EqualFold(value, "Ninguna") || strings.EqualFold(value, "Ninguna conocida") {
+			continue
+		}
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO medical_alerts(patient_id,category,description,critical,recorded_by) VALUES($1,$2,$3,$4,$5)`, id, alert.category, value, alert.category == "allergy", actorID(r)); err != nil {
+			writeError(w, http.StatusInternalServerError, "No se pudieron guardar las alertas")
+			return
+		}
+	}
+	if _, err = tx.ExecContext(r.Context(), `DELETE FROM patient_guardians WHERE patient_id=$1 AND legal_guardian`, id); err != nil {
+		writeError(w, http.StatusInternalServerError, "No se pudo actualizar el tutor legal")
+		return
+	}
+	if guardian := strings.TrimSpace(in.Guardian); guardian != "" {
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO patient_guardians(patient_id,full_name,relationship,legal_guardian) VALUES($1,$2,'Tutor legal',TRUE)`, id, guardian); err != nil {
+			writeError(w, http.StatusInternalServerError, "No se pudo guardar el tutor legal")
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "No se pudo confirmar la actualización")
+		return
+	}
+	writeJSON(w, http.StatusOK, Patient{ID: id, Name: in.Name, Doc: in.Doc, Age: in.Age, Birth: in.Birth, Phone: in.Phone, Emergency: in.Emergency, Email: in.Email, Blood: in.Blood, Guardian: in.Guardian, Allergies: fallback(in.Allergies, "Ninguna conocida"), Conditions: fallback(in.Conditions, "Ninguna"), Insurance: fallback(in.Insurance, "Particular")})
+}
+
+type treatmentPlanItemInput struct {
+	Procedure     string  `json:"procedure"`
+	Phase         int     `json:"phase"`
+	Sessions      int     `json:"sessions"`
+	Fee           float64 `json:"fee"`
+	LabCost       float64 `json:"labCost"`
+	MaterialsCost float64 `json:"materialsCost"`
+}
+
+type treatmentPlanInput struct {
+	PatientID int64                    `json:"patientId"`
+	Title     string                   `json:"title"`
+	Discount  float64                  `json:"discount"`
+	Items     []treatmentPlanItemInput `json:"items"`
+}
+
+func listTreatmentPlans(w http.ResponseWriter, r *http.Request) {
+	query := `SELECT t.id,t.patient_id,p.given_names || ' ' || p.family_names,t.title,t.status,t.subtotal,t.discount,t.total,t.created_at FROM treatment_plans t JOIN patients p ON p.id=t.patient_id WHERE p.clinic_id=$1`
+	args := []any{clinicID}
+	if raw := r.URL.Query().Get("patientId"); raw != "" {
+		patientID, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || patientID < 1 {
+			writeError(w, http.StatusBadRequest, "Paciente inválido")
+			return
+		}
+		query += ` AND t.patient_id=$2`
+		args = append(args, patientID)
+	}
+	query += ` ORDER BY t.created_at DESC`
+	rows, err := db.QueryContext(r.Context(), query, args...)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "No se pudieron cargar los planes")
+		return
+	}
+	type planRow struct {
+		ID, PatientID             int64
+		Patient, Title, Status    string
+		Subtotal, Discount, Total float64
+		Created                   time.Time
+	}
+	plans := []planRow{}
+	for rows.Next() {
+		var plan planRow
+		if err = rows.Scan(&plan.ID, &plan.PatientID, &plan.Patient, &plan.Title, &plan.Status, &plan.Subtotal, &plan.Discount, &plan.Total, &plan.Created); err != nil {
+			rows.Close()
+			writeError(w, 500, "No se pudo leer un plan")
+			return
+		}
+		plans = append(plans, plan)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		writeError(w, 500, "No se pudieron leer los planes")
+		return
+	}
+	rows.Close()
+	out := make([]map[string]any, 0, len(plans))
+	for _, plan := range plans {
+		itemRows, queryErr := db.QueryContext(r.Context(), `SELECT i.id,i.procedure_name,i.phase_number,i.sessions,i.fee,i.lab_cost,i.materials_cost,i.approved_at,i.completed_at,(SELECT count(*) FROM appointments a WHERE a.plan_item_id=i.id AND a.status NOT IN ('cancelled','no_show')) FROM treatment_plan_items i WHERE i.plan_id=$1 ORDER BY i.phase_number,i.id`, plan.ID)
+		if queryErr != nil {
+			writeError(w, 500, "No se pudieron cargar las partidas")
+			return
+		}
+		items := []map[string]any{}
+		for itemRows.Next() {
+			var id int64
+			var procedure string
+			var phase, sessions, scheduled int
+			var fee, lab, materials float64
+			var approved, completed sql.NullTime
+			if itemRows.Scan(&id, &procedure, &phase, &sessions, &fee, &lab, &materials, &approved, &completed, &scheduled) != nil {
+				itemRows.Close()
+				writeError(w, 500, "No se pudo leer una partida")
+				return
+			}
+			items = append(items, map[string]any{"id": id, "procedure": procedure, "phase": phase, "sessions": sessions, "scheduledSessions": scheduled, "availableSessions": max(0, sessions-scheduled), "fee": fee, "labCost": lab, "materialsCost": materials, "approved": approved.Valid, "completed": completed.Valid})
+		}
+		if err = itemRows.Err(); err != nil {
+			itemRows.Close()
+			writeError(w, 500, "No se pudieron leer las partidas")
+			return
+		}
+		itemRows.Close()
+		out = append(out, map[string]any{"id": plan.ID, "patientId": plan.PatientID, "patient": plan.Patient, "title": plan.Title, "status": plan.Status, "subtotal": plan.Subtotal, "discount": plan.Discount, "total": plan.Total, "createdAt": plan.Created, "items": items})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func createTreatmentPlan(w http.ResponseWriter, r *http.Request) {
+	var in treatmentPlanInput
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Title = strings.TrimSpace(in.Title)
+	if in.PatientID < 1 || in.Title == "" || len(in.Items) == 0 || len(in.Items) > 30 || in.Discount < 0 {
+		writeError(w, 400, "Paciente, título y al menos una partida válida son obligatorios")
+		return
+	}
+	subtotal := 0.0
+	for i := range in.Items {
+		item := &in.Items[i]
+		item.Procedure = strings.TrimSpace(item.Procedure)
+		if item.Procedure == "" || item.Phase < 1 || item.Sessions < 1 || item.Sessions > 100 || item.Fee < 0 || item.LabCost < 0 || item.MaterialsCost < 0 {
+			writeError(w, 400, "Revisa el procedimiento, fase, sesiones y costos de cada partida")
+			return
+		}
+		subtotal += item.Fee + item.LabCost + item.MaterialsCost
+	}
+	if in.Discount > subtotal {
+		writeError(w, 400, "El descuento no puede superar el subtotal")
+		return
+	}
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "No se pudo iniciar el plan")
+		return
+	}
+	defer tx.Rollback()
+	var patientExists bool
+	if err = tx.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM patients WHERE id=$1 AND clinic_id=$2 AND active)`, in.PatientID, clinicID).Scan(&patientExists); err != nil || !patientExists {
+		writeError(w, 404, "Paciente no encontrado")
+		return
+	}
+	var planID int64
+	err = tx.QueryRowContext(r.Context(), `INSERT INTO treatment_plans(patient_id,provider_id,title,status,subtotal,discount,total) VALUES($1,$2,$3,'presented',$4,$5,$6) RETURNING id`, in.PatientID, actorID(r), in.Title, subtotal, in.Discount, subtotal-in.Discount).Scan(&planID)
+	if err != nil {
+		writeError(w, 500, "No se pudo guardar el plan")
+		return
+	}
+	for _, item := range in.Items {
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO treatment_plan_items(plan_id,procedure_name,phase_number,sessions,fee,lab_cost,materials_cost) VALUES($1,$2,$3,$4,$5,$6,$7)`, planID, item.Procedure, item.Phase, item.Sessions, item.Fee, item.LabCost, item.MaterialsCost); err != nil {
+			writeError(w, 500, "No se pudo guardar una partida")
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, 500, "No se pudo confirmar el plan")
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": planID, "patientId": in.PatientID, "title": in.Title, "status": "presented", "subtotal": subtotal, "discount": in.Discount, "total": subtotal - in.Discount})
+}
+
+func approveTreatmentPlan(w http.ResponseWriter, r *http.Request) {
+	planID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || planID < 1 {
+		writeError(w, 400, "Plan inválido")
+		return
+	}
+	var in struct {
+		ItemIDs []int64 `json:"itemIds"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if len(in.ItemIDs) == 0 {
+		writeError(w, 400, "Selecciona al menos una partida aprobada")
+		return
+	}
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "No se pudo iniciar la aprobación")
+		return
+	}
+	defer tx.Rollback()
+	var clinic int64
+	if err = tx.QueryRowContext(r.Context(), `SELECT p.clinic_id FROM treatment_plans t JOIN patients p ON p.id=t.patient_id WHERE t.id=$1 FOR UPDATE`, planID).Scan(&clinic); err != nil || clinic != clinicID {
+		writeError(w, 404, "Plan no encontrado")
+		return
+	}
+	seen := map[int64]bool{}
+	for _, itemID := range in.ItemIDs {
+		if itemID < 1 || seen[itemID] {
+			writeError(w, 400, "Partidas inválidas o repetidas")
+			return
+		}
+		seen[itemID] = true
+		res, e := tx.ExecContext(r.Context(), `UPDATE treatment_plan_items SET approved_at=COALESCE(approved_at,now()) WHERE id=$1 AND plan_id=$2 AND completed_at IS NULL`, itemID, planID)
+		if e != nil {
+			writeError(w, 500, "No se pudo aprobar una partida")
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			writeError(w, 404, "Una partida ya no está disponible")
+			return
+		}
+	}
+	var total, approved int
+	if err = tx.QueryRowContext(r.Context(), `SELECT count(*),count(*) FILTER(WHERE approved_at IS NOT NULL) FROM treatment_plan_items WHERE plan_id=$1`, planID).Scan(&total, &approved); err != nil {
+		writeError(w, 500, "No se pudo verificar la aprobación")
+		return
+	}
+	status := "partially_approved"
+	if approved == total {
+		status = "approved"
+	}
+	if _, err = tx.ExecContext(r.Context(), `UPDATE treatment_plans SET status=$1 WHERE id=$2`, status, planID); err != nil {
+		writeError(w, 500, "No se pudo actualizar el plan")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, 500, "No se pudo confirmar la aprobación")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"planId": planID, "status": status, "approvedItems": approved, "totalItems": total, "readyToSchedule": true})
+}
+
+func closeCash(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		DeclaredCash float64 `json:"declaredCash"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.DeclaredCash < 0 {
+		writeError(w, 400, "El efectivo contado no puede ser negativo")
+		return
+	}
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "No se pudo iniciar el cierre")
+		return
+	}
+	defer tx.Rollback()
+	var lockResult any
+	if err = tx.QueryRowContext(r.Context(), `SELECT pg_advisory_xact_lock($1)`, clinicID).Scan(&lockResult); err != nil {
+		writeError(w, 500, "No se pudo bloquear la caja para el cierre")
+		return
+	}
+	var periodStart time.Time
+	err = tx.QueryRowContext(r.Context(), `SELECT closed_at FROM cash_closures WHERE clinic_id=$1 ORDER BY closed_at DESC LIMIT 1`, clinicID).Scan(&periodStart)
+	if errors.Is(err, sql.ErrNoRows) {
+		loc, _ := time.LoadLocation("America/Guayaquil")
+		now := time.Now().In(loc)
+		periodStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	} else if err != nil {
+		writeError(w, 500, "No se pudo consultar el cierre anterior")
+		return
+	}
+	var expected, total float64
+	var count int
+	if err = tx.QueryRowContext(r.Context(), `SELECT COALESCE(sum(p.amount) FILTER(WHERE p.method='cash'),0),COALESCE(sum(p.amount),0),count(*) FROM payments p JOIN invoices i ON i.id=p.invoice_id WHERE i.clinic_id=$1 AND p.received_at >= $2`, clinicID, periodStart).Scan(&expected, &total, &count); err != nil {
+		writeError(w, 500, "No se pudieron calcular los cobros del turno")
+		return
+	}
+	difference := in.DeclaredCash - expected
+	var closureID int64
+	var closedAt time.Time
+	err = tx.QueryRowContext(r.Context(), `INSERT INTO cash_closures(clinic_id,closed_by,period_start,declared_cash,expected_cash,total_collected,payment_count,difference) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,closed_at`, clinicID, actorID(r), periodStart, in.DeclaredCash, expected, total, count, difference).Scan(&closureID, &closedAt)
+	if err != nil {
+		writeError(w, 500, "No se pudo registrar el cierre")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, 500, "No se pudo confirmar el cierre")
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": closureID, "periodStart": periodStart, "closedAt": closedAt, "declaredCash": in.DeclaredCash, "expectedCash": expected, "difference": difference, "totalCollected": total, "paymentCount": count})
 }
 
 func listAppointments(w http.ResponseWriter, r *http.Request) {
@@ -1240,9 +1849,37 @@ func createAppointment(w http.ResponseWriter, r *http.Request) {
 	}
 	state := statusCode(in.Status)
 	var id int64
-	err = db.QueryRowContext(r.Context(), `INSERT INTO appointments(clinic_id,patient_id,chair_id,provider_id,starts_at,ends_at,reason,status,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, clinicID, patientID, chairID, providerID, start, start.Add(30*time.Minute), in.Procedure, state, actorID(r)).Scan(&id)
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, 500, "No se pudo iniciar el agendamiento")
+		return
+	}
+	defer tx.Rollback()
+	if in.PlanItemID > 0 {
+		var approvedProcedure string
+		var sessions int
+		err = tx.QueryRowContext(r.Context(), `SELECT i.procedure_name,i.sessions FROM treatment_plan_items i JOIN treatment_plans t ON t.id=i.plan_id JOIN patients p ON p.id=t.patient_id WHERE i.id=$1 AND t.patient_id=$2 AND p.clinic_id=$3 AND i.approved_at IS NOT NULL AND i.completed_at IS NULL FOR UPDATE OF i`, in.PlanItemID, patientID, clinicID).Scan(&approvedProcedure, &sessions)
+		if err != nil || !strings.EqualFold(strings.TrimSpace(approvedProcedure), strings.TrimSpace(in.Procedure)) {
+			writeError(w, http.StatusBadRequest, "La cita debe corresponder a una partida aprobada del plan del paciente")
+			return
+		}
+		var scheduled int
+		if err = tx.QueryRowContext(r.Context(), `SELECT count(*) FROM appointments WHERE plan_item_id=$1 AND status NOT IN ('cancelled','no_show')`, in.PlanItemID).Scan(&scheduled); err != nil {
+			writeError(w, 500, "No se pudo verificar las sesiones disponibles")
+			return
+		}
+		if scheduled >= sessions {
+			writeError(w, 409, "Ya se agendaron todas las sesiones aprobadas para este procedimiento")
+			return
+		}
+	}
+	err = tx.QueryRowContext(r.Context(), `INSERT INTO appointments(clinic_id,patient_id,chair_id,provider_id,starts_at,ends_at,reason,status,created_by,plan_item_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,0)) RETURNING id`, clinicID, patientID, chairID, providerID, start, start.Add(30*time.Minute), in.Procedure, state, actorID(r), in.PlanItemID).Scan(&id)
 	if err != nil {
 		writeError(w, http.StatusConflict, "El sillón ya tiene una cita en ese horario")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusConflict, "No se pudo confirmar la cita; revisa si el sillón ya está ocupado")
 		return
 	}
 	writeJSON(w, http.StatusCreated, Appointment{ID: id, Patient: in.Patient, Doctor: fallback(in.Doctor, "Dra. Valeria Ruiz"), Procedure: in.Procedure, Date: in.Date, Time: in.Time, Chair: in.Chair, Status: statusLabel(state)})
@@ -1268,7 +1905,8 @@ func updateAppointmentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	var previous, procedure string
-	if err = tx.QueryRowContext(r.Context(), `SELECT status,reason FROM appointments WHERE id=$1 AND clinic_id=$2 FOR UPDATE`, id, clinicID).Scan(&previous, &procedure); err != nil {
+	var planItemID sql.NullInt64
+	if err = tx.QueryRowContext(r.Context(), `SELECT status,reason,plan_item_id FROM appointments WHERE id=$1 AND clinic_id=$2 FOR UPDATE`, id, clinicID).Scan(&previous, &procedure, &planItemID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, 404, "Cita no encontrada")
 		} else {
@@ -1286,6 +1924,12 @@ func updateAppointmentStatus(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeError(w, 500, "No se pudo descargar el inventario: "+err.Error())
 			return
+		}
+		if planItemID.Valid {
+			if _, err = tx.ExecContext(r.Context(), `UPDATE treatment_plan_items i SET completed_at=COALESCE(i.completed_at,now()) WHERE i.id=$1 AND i.sessions <= (SELECT count(*) FROM appointments a WHERE a.plan_item_id=i.id AND a.status='attended')`, planItemID.Int64); err != nil {
+				writeError(w, 500, "No se pudo actualizar el avance del plan")
+				return
+			}
 		}
 	}
 	if err = tx.Commit(); err != nil {
@@ -1777,7 +2421,7 @@ func cors(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 		allowed := origin == "http://localhost:5174" || origin == "http://127.0.0.1:5174"
 		for _, o := range strings.Split(env("CORS_ORIGINS", ""), ",") {
-			if o = strings.TrimSpace(o); o != "" && o == origin {
+			if originMatches(strings.TrimSpace(o), origin) {
 				allowed = true
 			}
 		}
@@ -1793,6 +2437,22 @@ func cors(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func originMatches(rule, origin string) bool {
+	if rule == "" || origin == "" {
+		return false
+	}
+	if rule == origin {
+		return true
+	}
+	const wildcardScheme = "https://*"
+	if !strings.HasPrefix(rule, wildcardScheme) || !strings.HasPrefix(origin, "https://") {
+		return false
+	}
+	suffix := strings.TrimPrefix(rule, wildcardScheme)
+	host := strings.TrimPrefix(origin, "https://")
+	return suffix != "" && strings.HasSuffix(host, suffix) && len(host) > len(suffix)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, value any) bool {
