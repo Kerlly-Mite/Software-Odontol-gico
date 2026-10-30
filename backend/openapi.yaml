@@ -1,0 +1,501 @@
+openapi: 3.0.3
+info:
+  title: SIGO-Dental API
+  version: 0.1.0
+  description: API de demostración para gestión clínica odontológica. No usar con datos clínicos reales.
+servers:
+  - url: http://localhost:8080
+    description: Desarrollo local
+tags:
+  - name: Sesión
+  - name: Pacientes
+  - name: Agenda
+  - name: Caja
+  - name: Expediente
+  - name: Inventario
+  - name: Finanzas
+  - name: Reportes
+paths:
+  /api/health:
+    get:
+      tags: [Sesión]
+      summary: Estado de la API
+      responses:
+        '200':
+          description: API disponible y conectada a la base
+  /api/auth/login:
+    post:
+      tags: [Sesión]
+      summary: Iniciar sesión
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginInput' }
+      responses:
+        '200':
+          description: Token y perfil
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { description: Se requiere el código MFA o completar inscripción }
+  /api/auth/mfa/setup:
+    post:
+      tags: [Sesión]
+      security: [{ bearerAuth: [] }]
+      summary: Iniciar inscripción TOTP
+      responses:
+        '200':
+          description: Clave manual y URI otpauth para la aplicación autenticadora
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: { type: string }
+                  account: { type: string }
+                  otpauthUrl: { type: string }
+  /api/auth/mfa/verify-setup:
+    post:
+      tags: [Sesión]
+      security: [{ bearerAuth: [] }]
+      summary: Confirmar inscripción TOTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties: { code: { type: string, pattern: '^[0-9]{6}$' } }
+      responses:
+        '200': { description: Segundo factor activado }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/patients:
+    get:
+      tags: [Pacientes]
+      security: [{ bearerAuth: [] }]
+      summary: Listar pacientes activos
+      responses:
+        '200':
+          description: Pacientes de la clínica
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Patient' } }
+    post:
+      tags: [Pacientes]
+      security: [{ bearerAuth: [] }]
+      summary: Crear paciente
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatientInput' }
+      responses:
+        '201': { description: Paciente creado }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/appointments:
+    get:
+      tags: [Agenda]
+      security: [{ bearerAuth: [] }]
+      summary: Listar citas
+      responses:
+        '200': { description: Citas de la clínica }
+    post:
+      tags: [Agenda]
+      security: [{ bearerAuth: [] }]
+      summary: Agendar cita
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppointmentInput' }
+      responses:
+        '201': { description: Cita creada }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/appointments/{id}/status:
+    patch:
+      tags: [Agenda]
+      security: [{ bearerAuth: [] }]
+      summary: Cambiar estado de cita; Atendido aplica reglas de consumo configuradas
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties: { status: { type: string } }
+      responses:
+        '200':
+          description: Estado actualizado y advertencias de inventario, si existen
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  inventoryWarnings: { type: array, items: { type: string } }
+  /api/invoices:
+    get:
+      tags: [Caja]
+      security: [{ bearerAuth: [] }]
+      summary: Listar facturas y pagos
+      responses:
+        '200': { description: Comprobantes de la clínica }
+    post:
+      tags: [Caja]
+      security: [{ bearerAuth: [] }]
+      summary: Crear factura y registrar pago inicial
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patient, concept, total, paid, method]
+              properties:
+                patient: { type: string }
+                concept: { type: string }
+                total: { type: number, minimum: 0 }
+                paid: { type: number, minimum: 0 }
+                method: { type: string }
+      responses:
+        '201': { description: Factura creada }
+  /api/patients/{patientID}/clinical-notes:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+    get:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Listar notas clínicas SOAP
+      responses:
+        '200': { description: Notas inmutables del paciente }
+    post:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Crear nota clínica SOAP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subjective: { type: string }
+                objective: { type: string }
+                assessment: { type: string }
+                plan: { type: string }
+      responses:
+        '201': { description: Nota agregada al expediente }
+  /api/patients/{patientID}/odontograms:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+    get:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Consultar odontograma más reciente
+      responses:
+        '200': { description: Hallazgos dentales y superficies marcadas }
+    post:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Guardar odontograma
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dentition: { type: string, enum: [Permanente, Temporal] }
+                notation: { type: string, enum: [FDI, universal] }
+                toothStatus: { type: object, additionalProperties: { type: string } }
+                surfaceStatus: { type: object, additionalProperties: { type: boolean } }
+      responses:
+        '201': { description: Odontograma guardado }
+  /api/patients/{patientID}/periodontogram:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+    get:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Consultar mediciones periodontales
+      responses:
+        '200': { description: Mediciones por diente y sitio }
+    put:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Guardar mediciones periodontales
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { readings: { type: object, additionalProperties: { type: string } } }
+      responses:
+        '200': { description: Mediciones guardadas }
+  /api/patients/{patientID}/prescriptions:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+    get:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Listar recetas
+      responses:
+        '200': { description: Recetas del paciente }
+    post:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Crear receta
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [med, dose, duration]
+              properties:
+                med: { type: string }
+                dose: { type: string }
+                duration: { type: string }
+      responses:
+        '201': { description: Receta guardada }
+  /api/patients/{patientID}/consents:
+    parameters:
+      - { $ref: '#/components/parameters/PatientID' }
+    get:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Listar consentimientos
+      responses:
+        '200': { description: Consentimientos del paciente }
+    post:
+      tags: [Expediente]
+      security: [{ bearerAuth: [] }]
+      summary: Preparar consentimiento pendiente de firma
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [procedure]
+              properties: { procedure: { type: string } }
+      responses:
+        '201': { description: Consentimiento pendiente de firma }
+  /api/inventory/products:
+    get:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Consultar catálogo y existencias
+      responses:
+        '200': { description: Productos, cantidades disponibles y alertas de stock mínimo }
+    post:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Crear insumo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sku, name, minimumStock, initialStock]
+              properties:
+                sku: { type: string }
+                name: { type: string }
+                category: { type: string }
+                unit: { type: string }
+                minimumStock: { type: number, minimum: 0 }
+                initialStock: { type: number, minimum: 0 }
+      responses:
+        '201': { description: Insumo creado }
+  /api/inventory/movements:
+    get:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Consultar movimientos recientes
+      parameters:
+        - in: query
+          name: productId
+          schema: { type: integer }
+      responses:
+        '200': { description: Entradas y consumos }
+    post:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Registrar entrada o consumo manual
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, type, quantity]
+              properties:
+                productId: { type: integer }
+                type: { type: string, enum: [receipt, consumption] }
+                quantity: { type: number, minimum: 0, exclusiveMinimum: true }
+                reference: { type: string }
+                notes: { type: string }
+      responses:
+        '201': { description: Movimiento registrado }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/inventory/consumption-rules:
+    get:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Listar reglas de consumo automático
+      responses:
+        '200': { description: Reglas activas por procedimiento }
+    post:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Configurar insumos a descontar por procedimiento
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [procedure, productId, quantity]
+              properties:
+                procedure: { type: string, description: Debe coincidir exactamente con el motivo de la cita }
+                productId: { type: integer }
+                quantity: { type: number }
+      responses:
+        '201': { description: Regla creada }
+  /api/inventory/consumption-rules/{id}:
+    delete:
+      tags: [Inventario]
+      security: [{ bearerAuth: [] }]
+      summary: Desactivar regla de consumo automático
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+      responses:
+        '204': { description: Regla desactivada }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/commissions/rules:
+    get:
+      tags: [Finanzas]
+      security: [{ bearerAuth: [] }]
+      summary: Consultar profesionales y reglas de honorarios
+      responses:
+        '200': { description: Reglas de comisión activas }
+    post:
+      tags: [Finanzas]
+      security: [{ bearerAuth: [] }]
+      summary: Crear regla de honorarios
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [providerId, type, value]
+              properties:
+                providerId: { type: integer }
+                procedure: { type: string, default: '*' }
+                type: { type: string, enum: [percentage, fixed, net_percentage] }
+                value: { type: number }
+                fee: { type: number }
+                labCost: { type: number }
+                materialsCost: { type: number }
+      responses:
+        '201': { description: Regla guardada }
+  /api/commissions/rules/{id}:
+    delete:
+      tags: [Finanzas]
+      security: [{ bearerAuth: [] }]
+      summary: Desactivar regla de honorarios
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+      responses:
+        '204': { description: Regla desactivada }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/reports/summary:
+    get:
+      tags: [Reportes]
+      security: [{ bearerAuth: [] }]
+      summary: Consultar indicadores del período
+      parameters:
+        - { in: query, name: from, schema: { type: string, format: date } }
+        - { in: query, name: to, schema: { type: string, format: date } }
+      responses:
+        '200': { description: Citas, pagos, saldos, stock bajo y honorarios estimados }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ID:
+      in: path
+      name: id
+      required: true
+      schema: { type: integer }
+    PatientID:
+      in: path
+      name: patientID
+      required: true
+      schema: { type: integer }
+  responses:
+    Error:
+      description: Solicitud rechazada
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        status: { type: integer }
+        message: { type: string }
+    LoginInput:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+        code: { type: string, pattern: '^[0-9]{6}$', description: Required when MFA is enabled }
+    Session:
+      type: object
+      properties:
+        token: { type: string }
+        user:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            email: { type: string }
+            role: { type: string }
+    Patient:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        doc: { type: string }
+        age: { type: integer }
+        phone: { type: string }
+        email: { type: string }
+        allergies: { type: string }
+        conditions: { type: string }
+    PatientInput:
+      allOf:
+        - { $ref: '#/components/schemas/Patient' }
+    AppointmentInput:
+      type: object
+      required: [patient, procedure, date, time, chair]
+      properties:
+        patient: { type: string }
+        doctor: { type: string }
+        procedure: { type: string }
+        date: { type: string, format: date }
+        time: { type: string }
+        chair: { type: string }

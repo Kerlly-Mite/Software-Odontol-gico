@@ -1,0 +1,55 @@
+# Despliegue con IP pública:  docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+# Solo el puerto 80 queda expuesto; la BD y la API NO se publican.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: sigo-dental-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sigodental}
+      POSTGRES_USER: ${POSTGRES_USER:-sigo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env.prod}
+    volumes:
+      - sigo_postgres_data:/var/lib/postgresql/data
+      - ./backend/database/001_fases_1_2.sql:/docker-entrypoint-initdb.d/001_fases_1_2.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sigo} -d ${POSTGRES_DB:-sigodental}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+    container_name: sigo-dental-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sigo}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sigodental}?sslmode=disable
+      PORT: 8080
+      JWT_SECRET: ${JWT_SECRET:?define JWT_SECRET en .env.prod}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?define MFA_ENCRYPTION_KEY en .env.prod}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: sigo-dental-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-80}:80"
+
+volumes:
+  sigo_postgres_data:
