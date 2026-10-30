@@ -22,11 +22,6 @@ services:
         generateValue: true
       - key: CORS_ORIGINS
         value: https://*.onrender.com
-      - key: API_PUBLIC_URL
-        fromService:
-          type: web
-          name: sigo-dental-api
-          envVarKey: RENDER_EXTERNAL_URL
 
   - type: web
     name: sigo-dental-web
@@ -39,7 +34,7 @@ services:
         fromService:
           type: web
           name: sigo-dental-api
-          envVarKey: API_PUBLIC_URL
+          envVarKey: RENDER_EXTERNAL_URL
     routes:
       - type: rewrite
         source: /*
